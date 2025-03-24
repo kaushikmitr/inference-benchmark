@@ -287,7 +287,7 @@ async def send_request(
         "temperature": 0.0 if use_beam_search else 1.0,
         "top_p": 1.0,
         "max_tokens": output_len,
-        "ignore_eos": False,
+        "ignore_eos": True,
         "stream": False,
     }
   elif backend == "tgi":
