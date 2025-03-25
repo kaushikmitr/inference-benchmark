@@ -73,6 +73,8 @@ def get_filtered_dataset(
     dataset_path: str,
     max_input_len: int,
     max_output_len: int,
+    min_input_len: int,
+    min_output_len: int,
     tokenizer: PreTrainedTokenizerBase,
     use_dummy_text: bool,
 ) -> List[Tuple[str, int, int]]:
@@ -111,7 +113,7 @@ def get_filtered_dataset(
   filtered_dataset: List[Tuple[str, int, int]] = []
   for prompt, prompt_token_ids, output_len in tokenized_dataset:
     prompt_len = len(prompt_token_ids)
-    if prompt_len < MIN_SEQ_LEN or output_len < MIN_SEQ_LEN:
+    if prompt_len < min_input_len or output_len < min_output_len:
       # Prune too short sequences.
       # This is because TGI causes errors when the input or output length
       # is too short.
@@ -154,6 +156,7 @@ def init_errors_map() -> Dict[str, int]:
 async def send_stream_request(
     backend: str,
     api_url: str,
+    dummy_url: str,
     prompt: str,
     prompt_len: int,
     output_len: int,
@@ -261,6 +264,7 @@ async def send_stream_request(
 async def send_request(
     backend: str,
     api_url: str,
+    dummy_url: str,
     prompt: str,
     prompt_len: int,
     output_len: int,
@@ -345,12 +349,14 @@ async def send_request(
 
   # Set client timeout to be 3 hrs.
   timeout = aiohttp.ClientTimeout(total=timeout)
-  async with aiohttp.ClientSession(timeout=timeout,trust_env=True,trace_configs=[trace_config]) as session:
+  async with aiohttp.ClientSession(timeout=timeout,trust_env=True,) as session:
     while True:
       try:
         async with session.post(api_url, headers=headers, json=pload, ssl=False) as response:
           output = await response.json()
-
+        request_end_time = time.time()
+        async with session.head(dummy_url, headers={}, ssl=False) as _:
+                pass
         # Re-send the request if it failed.
         if "error" not in output:
           break
@@ -379,7 +385,7 @@ async def send_request(
         errors["unknown_error"] += 1
         return None, None, None, errors
 
-  request_end_time = time.time()
+  
   # Naive HF transformers generation and TensorRT-LLM generation stops at EOS
   # tokens and the generation may be shorter than the ground-truth output
   # sequence length.
@@ -415,20 +421,21 @@ async def send_request(
 
 
 async def run_single_request(args: argparse.Namespace, api_url: str, tokenizer: PreTrainedTokenizerBase,
-                               prompt: str, prompt_len: int, output_len: int, chosen_model: str) -> Tuple[str, Tuple]:
+                               prompt: str, prompt_len: int, output_len: int, chosen_model: str, dummy_url: str) -> Tuple[str, Tuple]:
     if args.stream_request:
         result = await send_stream_request(
-            args.backend, api_url, prompt, prompt_len, output_len,
+            args.backend, api_url, dummy_url, prompt, prompt_len, output_len,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model, chosen_model, args.request_timeout,)
     else:
         result = await send_request(
-            args.backend, api_url, prompt, prompt_len, output_len,
+            args.backend, api_url, dummy_url, prompt, prompt_len, output_len,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model, chosen_model, args.request_timeout,)
     return chosen_model, result
 
 async def benchmark(
     args: argparse.Namespace, 
     api_url: str,
+    dummy_url: str,
     tokenizer: PreTrainedTokenizerBase,
     models: List[str],
     traffic_split: List[float],
@@ -437,7 +444,7 @@ async def benchmark(
     Also saves results separately for each model.
     """
     input_requests = get_filtered_dataset(
-        args.dataset, args.max_input_length, args.max_output_length, tokenizer, args.use_dummy_text)
+        args.dataset, args.max_input_length, args.max_output_length,  args.min_input_length, args.min_output_length,tokenizer, args.use_dummy_text)
     
     # Combine the models list and traffic split list into a dict
 
@@ -461,7 +468,7 @@ async def benchmark(
             break
         prompt, prompt_len, output_len = request
         chosen_model = random.choices(model_names, weights=model_weights)[0]
-        task = asyncio.create_task(run_single_request(args, api_url, tokenizer, prompt, prompt_len, output_len, chosen_model))
+        task = asyncio.create_task(run_single_request(args, api_url, tokenizer, prompt, prompt_len, output_len, chosen_model, dummy_url))
         tasks.append(task)
         prompts_sent += 1
 
@@ -866,8 +873,9 @@ async def main(args: argparse.Namespace):
 
   benchmark_start_time = time.time()
   args.start_datetime = datetime.fromtimestamp(benchmark_start_time)
+  dummy_url = f"http://{args.host}:{args.port}/health" if args.dummy_url is None else args.dummy_url
   
-  await benchmark(args, api_url, tokenizer,models, args.traffic_split)
+  await benchmark(args, api_url, dummy_url, tokenizer,models, args.traffic_split)
   
 
 
@@ -966,6 +974,22 @@ if __name__ == "__main__":
       ),
   )
   parser.add_argument(
+      "--min-input-length",
+      type=int,
+      default=4,
+      help=(
+          "Minimum number of input tokens for filtering the benchmark dataset."
+      ),
+  )
+  parser.add_argument(
+      "--min-output-length",
+      type=int,
+      default=4,
+      help=(
+          "Minimum number of output tokens for filtering the benchmark dataset."
+      ),
+  )
+  parser.add_argument(
       "--top-k",
       type=int,
       default=32000,
@@ -1050,8 +1074,10 @@ if __name__ == "__main__":
       action="store_true",
       help="Whether to scrape server metrics.",
   )
+  parser.add_argument("--dummy-url", type=str)
   parser.add_argument("--pm-namespace", type=str, default="default", help="namespace of the pod monitoring object, ignored if scrape-server-metrics is false")
   parser.add_argument("--pm-job", type=str, default="vllm-podmonitoring", help="name of the pod monitoring object, ignored if scrape-server-metrics is false")
+
   cmd_args = parser.parse_args()
   
   level = logging.INFO
