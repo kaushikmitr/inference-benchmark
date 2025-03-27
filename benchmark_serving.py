@@ -355,7 +355,8 @@ async def send_request(
         async with session.post(api_url, headers=headers, json=pload, ssl=False) as response:
           output = await response.json()
         request_end_time = time.time()
-        async with session.post(dummy_url, headers={}, ssl=False) as _:
+        if dummy_url:
+          async with session.post(dummy_url, headers={}, ssl=False) as _:
                 pass
         # Re-send the request if it failed.
         if "error" not in output:
@@ -902,9 +903,9 @@ async def main(args: argparse.Namespace):
 
   benchmark_start_time = time.time()
   args.start_datetime = datetime.fromtimestamp(benchmark_start_time)
-  dummy_url = f"http://{args.host}:{args.port}/health" if args.dummy_url is None else args.dummy_url
+
   
-  await benchmark(args, api_url, dummy_url, tokenizer,models, args.traffic_split)
+  await benchmark(args, api_url, args.dummy_url, tokenizer,models, args.traffic_split)
   
 
 
