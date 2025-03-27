@@ -16,6 +16,7 @@
 set -o xtrace
 
 export IP=$IP
+export VLLM_USE_V1="1"
 
 huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 
@@ -61,6 +62,12 @@ for request_rate in $(echo $REQUEST_RATES | tr ',' ' '); do
   fi
   if [[ "$DUMMY_URL" ]]; then
     PYTHON_OPTS="$PYTHON_OPTS --dummy-url  $DUMMY_URL"
+  fi
+  if [[ "$PM_NAMESPACE" ]]; then
+    PYTHON_OPTS="$PYTHON_OPTS --pm-namespace  $PM_NAMESPACE"
+  fi
+  if [[ "$PM_JOB" ]]; then
+    PYTHON_OPTS="$PYTHON_OPTS --pm-job  $PM_JOB"
   fi
   $PYTHON $PYTHON_OPTS > $output_file
   cat $output_file

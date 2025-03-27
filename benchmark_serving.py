@@ -355,7 +355,7 @@ async def send_request(
         async with session.post(api_url, headers=headers, json=pload, ssl=False) as response:
           output = await response.json()
         request_end_time = time.time()
-        async with session.head(dummy_url, headers={}, ssl=False) as _:
+        async with session.post(dummy_url, headers={}, ssl=False) as _:
                 pass
         # Re-send the request if it failed.
         if "error" not in output:
@@ -463,9 +463,15 @@ async def benchmark(
     benchmark_start_time = time.time()
     tasks: List[asyncio.Task] = []
     prompts_sent = 0
+    request_sent_delta = []
+    prev_request_sent_time = benchmark_start_time
     async for request in generate_next_request(input_requests, args.request_rate):
+        
         if prompts_sent >= args.num_prompts:
+            request_end_time = time.time()
             break
+        request_sent_delta.append(time.time() - prev_request_sent_time)
+        prev_request_sent_time = time.time()
         prompt, prompt_len, output_len = request
         chosen_model = random.choices(model_names, weights=model_weights)[0]
         task = asyncio.create_task(run_single_request(args, api_url, tokenizer, prompt, prompt_len, output_len, chosen_model, dummy_url))
@@ -501,13 +507,14 @@ async def benchmark(
               per_model_results[chosen_model]["itls"].extend(itl)     
 
     benchmark_duration = time.time() - benchmark_start_time
-    
-    print_and_save_result(args, benchmark_duration, prompts_sent, "weighted",
+    request_sent_duration = request_end_time - benchmark_start_time
+    avg_qps_sent = np.mean([1 / delta for delta in request_sent_delta[1:]])
+    print_and_save_result(args, benchmark_duration, avg_qps_sent, prompts_sent, "weighted",
                           overall_results["latencies"], overall_results["ttfts"],
                           overall_results["itls"], overall_results["tpots"],
                           overall_results["errors"])
     for model, data in per_model_results.items():
-        print_and_save_result(args, benchmark_duration, len(data["latencies"]), model,
+        print_and_save_result(args, benchmark_duration, avg_qps_sent, len(data["latencies"]), model,
                               data["latencies"], data["ttfts"], data["itls"],
                               data["tpots"], data["errors"])
 
@@ -763,13 +770,29 @@ def get_stats_for_set(name, description, points):
     f'p90_{name}': p90,
     f'p99_{name}': p99,
   }
-
-def print_and_save_result(args: argparse.Namespace, benchmark_duration, total_requests, model, request_latencies, ttfts, itls, tpots, errors):
+def print_histogram(values, bucket_size, label):
+    if not values:
+        print(f"No data for {label}")
+        return
+    max_val = max(values)
+    num_buckets = (max_val // bucket_size) + 1
+    histogram = [0] * int(num_buckets)
+    for v in values:
+         bucket = v // bucket_size
+         histogram[int(bucket)] += 1
+    print(f"\nHistogram for {label} (bucket size {bucket_size}):")
+    for i, count in enumerate(histogram):
+         lower = i * bucket_size
+         upper = (i+1) * bucket_size - 1
+         print(f"  {lower:3d}-{upper:3d}: {count}")
+         
+def print_and_save_result(args: argparse.Namespace, benchmark_duration, avg_qps_sent, total_requests, model, request_latencies, ttfts, itls, tpots, errors):
   benchmark_result = {}
 
   print(f"====Result for Model: {model}====")
   print(f"Errors: {errors}")
   print(f"Total time: {benchmark_duration:.2f} s")
+  print(f"Effective qps: {avg_qps_sent:.2f}")
   print(f"Successful/total requests: {len(request_latencies)}/{total_requests}")
   print(f"Requests/min: {60 * total_requests / benchmark_duration:.2f}")
   benchmark_result["num_prompts_attempted"] = total_requests
@@ -799,6 +822,12 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration, total_re
   print(f"Tokens/min: {tokens_per_min:.2f}")
   benchmark_result['total_tokens'] = int(total_tokens)
   benchmark_result['tokens_per_min'] = tokens_per_min
+    # --- Added code to print histograms ---
+  #input_lengths = [prompt_len for prompt_len, _, _ in request_latencies]
+  #output_lengths = [output_len for _, output_len, _ in request_latencies]
+  #print_histogram(input_lengths, 50, "Input Token Lengths")
+  #print_histogram(output_lengths, 50, "Output Token Lengths")
+  
   ttft_stats = {}
   itls_stats = {}
   tpot_stats = {}
