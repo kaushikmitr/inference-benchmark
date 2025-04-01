@@ -672,10 +672,10 @@ def print_metrics(metrics: List[str], duration: float, namespace: str, job: str)
 
   for metric in metrics:
     # Find metric type
+    if metric not in all_metrics_metadata['data']:
+      logger.debug(f"No metric found for {metric}")
+      continue
     metric_type = all_metrics_metadata['data'][metric]
-    if all_metrics_metadata['data'][metric] is None:
-      print("No metric found for: %s" % metric)
-      return
     metric_type = metric_type[0]['type']
 
     metric_results = {}
