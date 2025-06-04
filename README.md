@@ -190,3 +190,11 @@ The following are the set of flags the benchmarking script takes in. These are a
     * Type: `str`
     * Default: `vllm-podmonitoring`
     * Description: name of the pod monitoring object, ignored if scrape-server-metrics is false.
+* `--spanner-instance-id`:
+    * Type: `str`
+    * Default: `lpg-instance`
+    * Description: Specifies the Spanner instance ID to use for storing benchmark results or metadata.
+* `--spanner-database-id`:
+    * Type: `str`
+    * Default: `lpg-prod-ig-test`
+    * Description: Specifies the Spanner database ID to use for storing benchmark results or metadata.
