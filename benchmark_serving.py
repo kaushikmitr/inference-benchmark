@@ -80,7 +80,9 @@ def extract_proto_fields(data, run_type):
         'model_server': config['model_server'],
         'backend': config['backend'],
         'gpu_cache_usage_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:gpu_cache_usage_perc', {}).get('P90', 0.0),
-        'num_requests_waiting_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:num_requests_waiting', {}).get('P90', 0.0)
+        'num_requests_waiting_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:num_requests_waiting', {}).get('P90', 0.0),
+        'gpu_cache_usage_mean': data.get('metrics', {}).get('server_metrics', {}).get('vllm:gpu_cache_usage_perc', {}).get('Mean', 0.0),
+        'num_requests_waiting_mean': data.get('metrics', {}).get('server_metrics', {}).get('vllm:num_requests_waiting', {}).get('Mean', 0.0),
     }
 
     metrics = data.get('metrics', {})
@@ -96,22 +98,22 @@ def extract_proto_fields(data, run_type):
     }
 
     summary_stats = {
-        'prompts_attempted': prompt_dataset['num_prompts_attempted'],
-        'prompts_succeeded': prompt_dataset['num_prompts_succeeded'],
-        'input_size_avg': prompt_dataset['avg_input_len'],
-        'output_size_avg': prompt_dataset['avg_output_len'],
-        'p90_per_output_token_latency': metrics.get('p90_per_output_token_latency', 0.0),
-        'output_tokens_per_min': metrics.get('output_tokens_per_min', 0.0),
-        'gpu_cache_usage_perc': infrastructure['gpu_cache_usage_p90'],
-        'num_requests_waiting': infrastructure['num_requests_waiting_p90'],
-        'request_rate': metrics.get('request_rate', 0),
+        'p90_normalized_time_per_output_token_ms': metrics.get('p90_normalized_time_per_output_token_ms', 0.0),
+        'avg_normalized_time_per_output_token_ms': metrics.get('avg_normalized_time_per_output_token_ms', 0.0),
         'throughput': metrics.get('throughput', 0.0),
+        'input_tokens_per_sec': metrics.get('input_tokens_per_sec', 0.0),
         'benchmark_time': metrics.get('benchmark_time', 0.0),
+        
         'date': data.get('dimensions', {}).get('date', ''),
-        'avg_latency': metrics.get('avg_latency', 0.0),
-        'median_latency': metrics.get('median_latency', 0.0),
-        'p90_latency': metrics.get('p90_latency', 0.0),
-        'p99_latency': metrics.get('p99_latency', 0.0)
+        'avg_latency_ms': metrics.get('avg_latency_ms', 0.0),
+        'median_latency_ms': metrics.get('median_latency_ms', 0.0),
+        'p90_latency_ms': metrics.get('p90_latency_ms', 0.0),
+        'p99_latency_ms': metrics.get('p99_latency_ms', 0.0),
+        'time_per_output_token_seconds_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:time_per_output_token_seconds', {}).get('P90', 0.0),
+        'time_to_first_token_seconds_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:time_to_first_token_seconds', {}).get('P90', 0.0),
+        'time_per_output_token_seconds_mean': data.get('metrics', {}).get('server_metrics', {}).get('vllm:time_per_output_token_seconds', {}).get('Mean', 0.0),
+        'time_to_first_token_seconds_mean': data.get('metrics', {}).get('server_metrics', {}).get('vllm:time_to_first_token_seconds', {}).get('Mean', 0.0),
+        
     }
 
     return config, infrastructure, prompt_dataset, summary_stats
@@ -613,7 +615,7 @@ async def benchmark(
     print_and_save_result(args, benchmark_duration_sec, prompts_sent, "weighted",
                           overall_results["latencies"], overall_results["ttfts"],
                           overall_results["itls"], overall_results["tpots"],
-                          overall_results["errors"], spanner_upload=True)
+                          overall_results["errors"], spanner_upload=True, server_metrics_scrape=True)
     for model, data in per_model_results.items():
         print_and_save_result(args, benchmark_duration_sec, len(data["latencies"]), model,
                               data["latencies"], data["ttfts"], data["itls"],
@@ -889,7 +891,7 @@ def get_stats_for_set(name, description, points):
     f'p99_{name}': p99,
   }
 
-def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, total_requests, model, request_latencies, ttfts, itls, tpots, errors, spanner_upload=False):
+def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, total_requests, model, request_latencies, ttfts, itls, tpots, errors, spanner_upload=False, server_metrics_scrape=False):
   benchmark_result = {}
 
   print(f"====Result for Model: {model}====")
@@ -952,7 +954,7 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, tota
   }
 
   server_metrics = {}
-  if args.scrape_server_metrics:
+  if args.scrape_server_metrics and server_metrics_scrape:
     server_metrics = print_metrics(metrics_to_scrape(args.backend), benchmark_duration_sec, args.pm_namespace, args.pm_job)
   if args.save_json_results:
     save_json_results(args, benchmark_result, server_metrics, model, errors, spanner_upload)
