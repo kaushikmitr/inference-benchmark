@@ -48,8 +48,11 @@ BASE_PYTHON_OPTS=(
 [[ "$STREAM_REQUEST" = "true" ]] && BASE_PYTHON_OPTS+=("--stream-request")
 [[ "$IGNORE_EOS" = "true" ]] && BASE_PYTHON_OPTS+=("--ignore-eos")
 [[ "$OUTPUT_BUCKET_FILEPATH" ]] && BASE_PYTHON_OPTS+=("--output-bucket-filepath" "$OUTPUT_BUCKET_FILEPATH")
+[[ "$SPANNER_INSTANCE_ID" ]] && BASE_PYTHON_OPTS+=("--spanner-instance-id" "$SPANNER_INSTANCE_ID")
+[[ "$SPANNER_DATABASE_ID" ]] && BASE_PYTHON_OPTS+=("--spanner-database-id" "$SPANNER_DATABASE_ID")
 
 SLEEP_TIME=${SLEEP_TIME:-0}
+POST_BENCHMARK_SLEEP_TIME=${POST_BENCHMARK_SLEEP_TIME:-infinity}
 
 for request_rate in $(echo $REQUEST_RATES | tr ',' ' '); do
   echo "Benchmarking request rate: ${request_rate}"
@@ -74,4 +77,4 @@ for request_rate in $(echo $REQUEST_RATES | tr ',' ' '); do
 done
 
 export LPG_FINISHED="true"
-sleep infinity
+sleep $POST_BENCHMARK_SLEEP_TIME

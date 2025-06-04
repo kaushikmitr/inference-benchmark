@@ -42,6 +42,12 @@ from transformers import PreTrainedTokenizerBase
 
 from google.protobuf.timestamp_pb2 import Timestamp
 
+import os
+import sys
+import uuid
+import traceback
+from google.cloud import spanner
+
 MIN_SEQ_LEN = 4
 NEW_TEXT_KEY = "\nOutput:\n"
 PROMETHEUS_PORT = 9090
@@ -54,6 +60,113 @@ tpot_metric = Histogram('LatencyProfileGenerator:time_per_output_token_ms', 'Tim
 ttft_metric = Histogram('LatencyProfileGenerator:time_to_first_token_ms', 'Time to first token per request (ms)', buckets=[2**i for i in range(1, 16)])
 active_requests_metric = Gauge('LatencyProfileGenerator:active_requests', 'How many requests actively being processed')
 
+
+def extract_proto_fields(data, run_type):
+    """Extract and structure relevant fields for Spanner insertion, including `run_type`."""
+
+    config = {
+        'model': data.get('config', {}).get('model', ''),
+        'num_models': data.get('config', {}).get('num_models', 0),
+        'model_server': data.get('config', {}).get('model_server', ''),
+        'backend': data.get('dimensions', {}).get('backend', ''),
+        'model_id': data.get('dimensions', {}).get('model_id', ''),
+        'tokenizer_id': data.get('dimensions', {}).get('tokenizer_id', ''),
+        'request_rate': data.get('metrics', {}).get('request_rate', 0),
+        'benchmark_time': data.get('metrics', {}).get('benchmark_time', 0),
+        'run_type': run_type
+    }
+
+    infrastructure = {
+        'model_server': config['model_server'],
+        'backend': config['backend'],
+        'gpu_cache_usage_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:gpu_cache_usage_perc', {}).get('P90', 0.0),
+        'num_requests_waiting_p90': data.get('metrics', {}).get('server_metrics', {}).get('vllm:num_requests_waiting', {}).get('P90', 0.0)
+    }
+
+    metrics = data.get('metrics', {})
+    prompt_dataset = {
+        'num_prompts_attempted': metrics.get('num_prompts_attempted', 0),
+        'num_prompts_succeeded': metrics.get('num_prompts_succeeded', 0),
+        'avg_input_len': metrics.get('avg_input_len', 0.0),
+        'median_input_len': metrics.get('median_input_len', 0.0),
+        'p90_input_len': metrics.get('p90_input_len', 0.0),
+        'avg_output_len': metrics.get('avg_output_len', 0.0),
+        'median_output_len': metrics.get('median_output_len', 0.0),
+        'p90_output_len': metrics.get('p90_output_len', 0.0)
+    }
+
+    summary_stats = {
+        'prompts_attempted': prompt_dataset['num_prompts_attempted'],
+        'prompts_succeeded': prompt_dataset['num_prompts_succeeded'],
+        'input_size_avg': prompt_dataset['avg_input_len'],
+        'output_size_avg': prompt_dataset['avg_output_len'],
+        'p90_per_output_token_latency': metrics.get('p90_per_output_token_latency', 0.0),
+        'output_tokens_per_min': metrics.get('output_tokens_per_min', 0.0),
+        'gpu_cache_usage_perc': infrastructure['gpu_cache_usage_p90'],
+        'num_requests_waiting': infrastructure['num_requests_waiting_p90'],
+        'request_rate': metrics.get('request_rate', 0),
+        'throughput': metrics.get('throughput', 0.0),
+        'benchmark_time': metrics.get('benchmark_time', 0.0),
+        'date': data.get('dimensions', {}).get('date', ''),
+        'avg_latency': metrics.get('avg_latency', 0.0),
+        'median_latency': metrics.get('median_latency', 0.0),
+        'p90_latency': metrics.get('p90_latency', 0.0),
+        'p99_latency': metrics.get('p99_latency', 0.0)
+    }
+
+    return config, infrastructure, prompt_dataset, summary_stats
+
+
+def upload_to_spanner(instance_id, database_id, json_files, gcs_base_uri, run_type):
+    spanner_client = spanner.Client()
+    instance = spanner_client.instance(instance_id)
+    database = instance.database(database_id)
+
+    print(f"📊 Uploading {len(json_files)} JSON files to Spanner with run_type='{run_type}'...")
+
+    commit_ts = spanner.COMMIT_TIMESTAMP
+    with database.batch() as batch:
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+
+                config, infra, prompt, stats = extract_proto_fields(data, run_type)
+                filename = os.path.basename(json_file)
+                gcs_uri = f"{gcs_base_uri}/{filename}"
+                latency_profile_id = str(uuid.uuid4())
+
+                config_json = json.dumps(config)
+                infra_json = json.dumps(infra)
+                prompt_json = json.dumps(prompt)
+                stats_json = json.dumps(stats)
+
+                batch.insert(
+                    table='LatencyProfiles',
+                    columns=['Id', 'Config', 'Infrastructure', 'PromptDataset', 'SummaryStats', 'GcsUri', 'InsertedAt'],
+                    values=[
+                        (latency_profile_id, config_json, infra_json, prompt_json, stats_json, gcs_uri, commit_ts)
+                    ]
+                )
+
+                if 'core_deployment_artifacts' in data or 'extension_deployment_artifacts' in data:
+                    core_json = json.dumps(data.get('core_deployment_artifacts', {}))
+                    ext_json = json.dumps(data.get('extension_deployment_artifacts', {}))
+                    batch.insert(
+                        table='DeploymentArtifacts',
+                        columns=['Id', 'LatencyProfileId', 'CoreDeploymentArtifacts', 'ExtensionDeploymentArtifacts'],
+                        values=[
+                            (str(uuid.uuid4()), latency_profile_id, core_json, ext_json)
+                        ]
+                    )
+
+                print(f"✅ {json_file} uploaded (ID: {latency_profile_id})")
+            except Exception as e:
+                print(f"❌ Failed to upload {json_file}: {e}")
+                traceback.print_exc()
+
+    print("✅ All files uploaded.")
+    
 # Add trace config for monitoring in flight requests
 async def on_request_start(session, trace_config_ctx, params):
     active_requests_metric.inc()
@@ -500,13 +613,13 @@ async def benchmark(
     print_and_save_result(args, benchmark_duration_sec, prompts_sent, "weighted",
                           overall_results["latencies"], overall_results["ttfts"],
                           overall_results["itls"], overall_results["tpots"],
-                          overall_results["errors"])
+                          overall_results["errors"], spanner_upload=True)
     for model, data in per_model_results.items():
         print_and_save_result(args, benchmark_duration_sec, len(data["latencies"]), model,
                               data["latencies"], data["ttfts"], data["itls"],
                               data["tpots"], data["errors"])
 
-def save_json_results(args: argparse.Namespace, benchmark_result, server_metrics, model, errors):
+def save_json_results(args: argparse.Namespace, benchmark_result, server_metrics, model, errors, spanner_upload: bool = False):
   # Setup
   start_dt_proto = Timestamp()
   start_dt_proto.FromDatetime(args.start_datetime)
@@ -601,6 +714,15 @@ def save_json_results(args: argparse.Namespace, benchmark_result, server_metrics
       print(f"File {file_name} uploaded to gs://{args.output_bucket}/{args.output_bucket_filepath}")
     except google.cloud.exceptions.NotFound:
       print(f"GS Bucket (gs://{args.output_bucket}) does not exist")
+  if args.spanner_instance_id and args.spanner_database_id and spanner_upload:
+    # Upload to Spanner
+    try:
+      upload_to_spanner(
+          args.spanner_instance_id, args.spanner_database_id, [file_name],
+          args.output_bucket, args.file_prefix)
+      print(f"File {file_name} uploaded to Spanner")
+    except Exception as e:
+      print(f"Failed to upload {file_name} to Spanner: {e}")
 
 def metrics_to_scrape(backend: str) -> List[str]:
   # Each key in the map is a metric, it has a corresponding 'stats' object
@@ -767,7 +889,7 @@ def get_stats_for_set(name, description, points):
     f'p99_{name}': p99,
   }
 
-def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, total_requests, model, request_latencies, ttfts, itls, tpots, errors):
+def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, total_requests, model, request_latencies, ttfts, itls, tpots, errors, spanner_upload=False):
   benchmark_result = {}
 
   print(f"====Result for Model: {model}====")
@@ -833,7 +955,7 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, tota
   if args.scrape_server_metrics:
     server_metrics = print_metrics(metrics_to_scrape(args.backend), benchmark_duration_sec, args.pm_namespace, args.pm_job)
   if args.save_json_results:
-    save_json_results(args, benchmark_result, server_metrics, model, errors)
+    save_json_results(args, benchmark_result, server_metrics, model, errors, spanner_upload)
 
 async def main(args: argparse.Namespace):
   print(args)
@@ -1068,6 +1190,18 @@ if __name__ == "__main__":
   )
   parser.add_argument("--pm-namespace", type=str, default="default", help="namespace of the pod monitoring object, ignored if scrape-server-metrics is false")
   parser.add_argument("--pm-job", type=str, default="vllm-podmonitoring", help="name of the pod monitoring object, ignored if scrape-server-metrics is false")
+  parser.add_argument(
+      "--spanner-instance-id",
+      type=str,
+      default='lpg-instance',
+      help="Spanner instance ID to upload results to.",
+  )
+  parser.add_argument(
+      "--spanner-database-id",
+      type=str,
+      default='lpg-prod-ig-test',
+      help="Spanner database ID to upload results to.",
+  )
   cmd_args = parser.parse_args()
   
   level = logging.INFO
