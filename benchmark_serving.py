@@ -24,6 +24,7 @@ import argparse
 import asyncio
 from datetime import datetime
 import json
+from locale import strcoll
 import random
 import requests
 import time
@@ -237,9 +238,69 @@ def upload_to_spanner_batch_with_retry(instance_id, database_id, json_files, gcs
         print("❌ Upload process failed after all retries.")
 
 
+def calculate_prediction_errors(actual_values, predicted_values):
+    """Calculate MAPE, RMSE, and MAE between actual and predicted values."""
+    if not actual_values or not predicted_values or len(actual_values) != len(predicted_values):
+        return {
+            'mape': 0.0,
+            'rmse': 0.0,
+            'mae': 0.0,
+            'count': 0
+        }
+    
+    # Filter out pairs where either value is 0 or negative (to avoid division by zero in MAPE)
+    valid_pairs = [(a, p) for a, p in zip(actual_values, predicted_values) if a > 0 and p > 0]
+    
+    if not valid_pairs:
+        return {
+            'mape': 0.0,
+            'rmse': 0.0,
+            'mae': 0.0,
+            'count': 0
+        }
+    
+    actual_clean = [pair[0] for pair in valid_pairs]
+    predicted_clean = [pair[1] for pair in valid_pairs]
+    
+    # Calculate errors
+    absolute_errors = [abs(a - p) for a, p in valid_pairs]
+    percentage_errors = [abs((a - p) / a) * 100 for a, p in valid_pairs]
+    squared_errors = [(a - p) ** 2 for a, p in valid_pairs]
+    
+    mape = np.mean(percentage_errors)
+    mae = np.mean(absolute_errors)
+    rmse = np.sqrt(np.mean(squared_errors))
+    
+    return {
+        'mape': mape,
+        'rmse': rmse,
+        'mae': mae,
+        'count': len(valid_pairs)
+    }
+
+def get_prediction_error_stats(name, actual_values, predicted_values):
+    """Get prediction error statistics and format them for output."""
+    errors = calculate_prediction_errors(actual_values, predicted_values)
+    
+    if errors['count'] > 0:
+        print(f"Prediction errors for {name}:")
+        print(f"  MAPE: {errors['mape']:.2f}%")
+        print(f"  RMSE: {errors['rmse']:.2f}")
+        print(f"  MAE: {errors['mae']:.2f}")
+        print(f"  Valid predictions: {errors['count']}")
+    else:
+        print(f"No valid prediction pairs for {name}")
+    
+    return {
+        f'{name}_prediction_mape': errors['mape'],
+        f'{name}_prediction_rmse': errors['rmse'],
+        f'{name}_prediction_mae': errors['mae'],
+        f'{name}_prediction_count': errors['count']
+    }
+
 MIN_SEQ_LEN = 4
 NEW_TEXT_KEY = "\nOutput:\n"
-PROMETHEUS_PORT = 9090
+
 
 # Prometheus Metrics
 prompt_length_metric = Histogram("LatencyProfileGenerator:prompt_length", "Input prompt length", buckets=[2**i for i in range(1, 16)])
@@ -249,6 +310,12 @@ tpot_metric = Histogram('LatencyProfileGenerator:time_per_output_token_ms', 'Tim
 ttft_metric = Histogram('LatencyProfileGenerator:time_to_first_token_ms', 'Time to first token per request (ms)', buckets=[2**i for i in range(1, 16)])
 active_requests_metric = Gauge('LatencyProfileGenerator:active_requests', 'How many requests actively being processed')
 total_request_count = Counter('LatencyProfileGenerator:request_count', 'How many total requests have been sent')
+
+# Additional metrics for client vs server tracking
+client_ttft_metric = Histogram('LatencyProfileGenerator:client_time_to_first_token_ms', 'Client-measured time to first token (ms)', buckets=[2**i for i in range(1, 16)])
+server_ttft_metric = Histogram('LatencyProfileGenerator:server_time_to_first_token_ms', 'Server-reported time to first token (ms)', buckets=[2**i for i in range(1, 16)])
+client_tpot_metric = Histogram('LatencyProfileGenerator:client_time_per_output_token_ms', 'Client-measured time per output token (ms)', buckets=[2**i for i in range(1, 16)])
+server_tpot_metric = Histogram('LatencyProfileGenerator:server_time_per_output_token_ms', 'Server-reported time per output token (ms)', buckets=[2**i for i in range(1, 16)])
 
 # Singleton class to track requests for QPS counting and calculation.
 class AsyncRequestCounter:
@@ -373,6 +440,7 @@ def init_errors_map() -> Dict[str, int]:
     "ClientOSError": 0,
     "ServerDisconnectedError": 0,
     "unknown_error": 0,
+    "HTTP429": 0,
   }
   return errors
 
@@ -391,13 +459,46 @@ async def send_stream_request(
     model: str,
     timeout: float,
     max_conn: int,
-) -> Tuple[Tuple[int, int, float], float, List[float], Dict[str, int]]:
-  """Sends stream request to server"""
-  request_start_time_ms = 1000 * time.time()
-  errors = init_errors_map()
+    ttft_slo: Optional[float] = None,
+    avg_tpot_slo: Optional[float] = None,
+    enable_slo_based_routing: bool = False,
+) -> Tuple[
+      Optional[Tuple[int, int, float]],  # (prompt_len, output_len, latency) or None
+      float,   # server_ttft_ms
+      float,   # client_ttft_ms
+      float,   # server_avg_tpot_ms
+      float,   # client_avg_tpot_ms
+      float,   # predicted_ttft_ms
+      float,   # predicted_tpot_ms
+      Dict[str, int]
+]:
+    """Send streaming request and track both server and client-side metrics."""
+    request_start_time_ms = 1000 * time.time()
+    errors = init_errors_map()
 
-  headers = {"User-Agent": "Benchmark Client"}
-  if backend == "vllm":
+    # Initialize metrics
+    server_ttft_ms = 0.0
+    client_ttft_ms = 0.0
+    server_avg_tpot_ms = 0.0
+    client_avg_tpot_ms = 0.0
+    predicted_ttft_ms = 0.0
+    predicted_tpot_ms = 0.0
+    
+    # Client-side timing tracking
+    start_perf_ms = 1000 * time.perf_counter()
+    first_token_time_ms = None
+    token_times = []
+    total_tokens_received = 0
+    last_usage = None
+    accumulated_text = ""
+
+    # Build headers & payload
+    headers = {"User-Agent": "Benchmark Client"}
+    if ttft_slo is not None and enable_slo_based_routing:
+        headers["ttft_slo"] = f"{ttft_slo:.6f}"
+    if avg_tpot_slo is not None and enable_slo_based_routing:
+        headers["avg_tpot_slo"] = f"{avg_tpot_slo:.6f}"
+
     pload = {
         "model": model,
         "prompt": prompt,
@@ -409,81 +510,175 @@ async def send_stream_request(
         "max_tokens": output_len,
         "ignore_eos": ignore_eos,
         "stream": True,
+        "stream_options": {"include_usage": "true"}
     }
-  elif backend == "jetstream":
-    pload = {
-        "prompt": prompt,
-        "max_tokens": output_len,
-        "stream": True,
-    }
-  else: 
-    raise ValueError(f"Unknown backend: {backend}")
 
-  ttft_ms = 0.0
-  itl_ms = []
-  start_time_ms = 1000 * time.perf_counter()
-  most_recent_timestamp = start_time_ms
-  output = ""
-  timeout = aiohttp.ClientTimeout(total=timeout)
-  async with aiohttp.ClientSession(timeout=timeout,trust_env=True,connector=aiohttp.TCPConnector(limit=max_conn)) as session:
+    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+    
     try:
-      async with session.post(api_url, headers=headers, json=pload, ssl=False) as response:
-        async for chunk_bytes in response.content.iter_chunks():
-          chunk_bytes = chunk_bytes[0].strip()
-          if not chunk_bytes:
-              continue
-          timestamp_ms = 1000 * time.perf_counter()
-          # First token
-          if ttft_ms == 0.0:
-            ttft_ms = timestamp_ms - start_time_ms
-          else:
-            itl_ms.append(timestamp_ms - most_recent_timestamp)
-          most_recent_timestamp = timestamp_ms
-          if backend == "vllm":
-            if chunk_bytes.decode("utf-8")[6:] != "[DONE]":
-              output += json.loads(chunk_bytes.decode("utf-8")[6:])["choices"][0]["text"]
-          elif backend == "jetstream":
-            if chunk_bytes.decode("utf-8") != "":
-              output += json.loads(chunk_bytes.decode("utf-8"))["text"]
-          
-    except aiohttp.client_exceptions.ClientConnectorError as client_err:
-      errors["ClientConnectorError"] += 1
-      print(f"ClientConnectorError: {client_err}")
-      return None, None, None, errors
-    except asyncio.TimeoutError as timeout_err:
-      errors["TimeoutError"] += 1
-      print(f"TimeoutError: {timeout_err}")
-      return None, None, None, errors
-    except aiohttp.client_exceptions.ClientOSError as e:
-      errors["ClientOSError"] += 1
-      print(f"ClientOSError: {e}")
-      return None, None, None, errors
-    except aiohttp.client_exceptions.ContentTypeError as e:
-      print(f"ContentTypeError: {e}, response: {response}")
-      errors["ContentTypeError"] += 1
-      return None, None, None, errors
-    except aiohttp.client_exceptions.ServerDisconnectedError as e:
-      errors["ServerDisconnectedError"] += 1
-      print(f"ServerDisconnectedError: {e}")
-      return None, None, None, errors
-    except Exception as e: 
-      print(f"Unknown error {e}")
-      errors["unknown_error"] += 1
-      return None, None, None, errors
-  request_end_time_ms = 1000 * time.time()
-  output_token_ids = tokenizer(output).input_ids
-  output_len = len(output_token_ids)
-  request_latency_ms = (prompt_len, output_len, (request_end_time_ms - request_start_time_ms))
+        async with aiohttp.ClientSession(
+            timeout=timeout_cfg,
+            trust_env=True,
+            trace_configs=[trace_config],
+            connector=aiohttp.TCPConnector(limit=max_conn),
+        ) as session:
+            async with session.post(api_url, headers=headers, json=pload, ssl=False) as resp:
+                if resp.status == 429:
+                    errors["HTTP429"] += 1
+                    return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+                if resp.status != 200:
+                    errors["unknown_error"] += 1
+                    return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+                
+                async for raw_chunk in resp.content.iter_chunks():
+                    chunk = raw_chunk[0].strip()
+                    if not chunk:
+                        continue
 
-  # Exclude first token for tpot calculation
-  if output_len > 1:
-    tpot_metric.observe((request_end_time_ms - ttft_ms - request_start_time_ms) / (output_len - 1))
-  normalized_time_per_output_token_metric.observe((request_end_time_ms - request_start_time_ms) / output_len)
-  if ttft_ms is not None:
-    ttft_metric.observe(ttft_ms)
-  prompt_length_metric.observe(prompt_len)
-  response_length_metric.observe(output_len)
-  return request_latency_ms, ttft_ms, itl_ms, None
+                    current_time_ms = 1000 * time.perf_counter()
+                    
+                    # Decode chunk
+                    try:
+                        text = chunk.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    
+                    # Handle multiple data lines in one chunk
+                    lines = text.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                            
+                        # Remove SSE prefix
+                        if line.startswith("data: "):
+                            payload = line[6:]
+                        else:
+                            payload = line
+
+                        if payload == "[DONE]":
+                            break
+
+                        # Parse the JSON event
+                        try:
+                            evt = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Track first token timing (client-side)
+                        choices = evt.get("choices", [])
+                        if choices and first_token_time_ms is None:
+                            # Check if this chunk contains actual content
+                            current_text = choices[0].get("text", "")
+                            if current_text.strip():
+                                first_token_time_ms = current_time_ms
+                                client_ttft_ms = first_token_time_ms - start_perf_ms
+                        
+                        # Track tokens for TPOT calculation
+                        if choices and first_token_time_ms is not None:
+                            current_text = choices[0].get("text", "")
+                            if current_text:
+                                # Add to accumulated text and count new tokens
+                                #new_text = current_text[len(accumulated_text):] if current_text.startswith(accumulated_text) else current_text
+                                if current_text.strip():
+                                    token_times.append(current_time_ms)
+                                    total_tokens_received += 1
+                                    accumulated_text += current_text
+
+                        # Extract server-provided usage metrics (usually in final chunk)
+                        usage = evt.get("usage")
+                        if isinstance(usage, dict) and usage:
+                            last_usage = usage
+
+    except aiohttp.client_exceptions.ClientConnectorError:
+        errors["ClientConnectorError"] += 1
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except asyncio.TimeoutError:
+        errors["TimeoutError"] += 1
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except aiohttp.client_exceptions.ClientOSError:
+        errors["ClientOSError"] += 1
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except aiohttp.client_exceptions.ContentTypeError:
+        errors["ContentTypeError"] += 1
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except aiohttp.client_exceptions.ServerDisconnectedError:
+        errors["ServerDisconnectedError"] += 1
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except Exception as e:
+        print(f"Unexpected error in send_stream_request: {e}")
+        errors["unknown_error"] += 1
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+
+    # Calculate final metrics
+    request_end_time_ms = 1000 * time.time()
+    total_latency_ms = request_end_time_ms - request_start_time_ms
+
+    # Calculate client-side TPOT if we have multiple token arrivals
+    if len(token_times) > 1:
+        # Calculate time between consecutive token chunks
+        inter_token_times = [token_times[i] - token_times[i-1] for i in range(1, len(token_times))]
+        client_avg_tpot_ms = np.mean(inter_token_times) if inter_token_times else 0.0
+    elif first_token_time_ms is not None and len(token_times) == 1:
+        # Only one token chunk received
+        client_avg_tpot_ms = max(0.0, (1000 * time.perf_counter() - first_token_time_ms))
+    else:
+        client_avg_tpot_ms = 0.0
+
+    # Extract server-provided metrics from your specific format
+    if last_usage is not None:
+        server_ttft_ms = float(last_usage.get("ttft_ms", 0.0))
+        predicted_ttft_ms = float(last_usage.get("predicted_ttft_ms", 0.0))
+        server_avg_tpot_ms = float(last_usage.get("avg_tpot_ms", 0.0))
+        predicted_tpot_ms = float(last_usage.get("avg_predicted_tpot_ms", 0.0))
+
+
+            
+        
+        # Use server-provided token counts if available
+        completion_tokens = last_usage.get("completion_tokens", 0)
+        if completion_tokens > 0:
+            actual_output_len = completion_tokens
+        else:
+            actual_output_len = total_tokens_received if total_tokens_received > 0 else output_len
+    else:
+        # Fallback to client measurements
+        actual_output_len = total_tokens_received if total_tokens_received > 0 else output_len
+
+
+    # Record metrics (prefer server metrics when available, fall back to client metrics)
+    ttft_to_record = server_ttft_ms if server_ttft_ms > 0 else client_ttft_ms
+    tpot_to_record = server_avg_tpot_ms if server_avg_tpot_ms > 0 else client_avg_tpot_ms
+
+    if ttft_to_record > 0:
+        ttft_metric.observe(ttft_to_record)
+    if tpot_to_record > 0:
+        tpot_metric.observe(tpot_to_record)
+    
+    # Record separate client and server metrics
+    if client_ttft_ms > 0:
+        client_ttft_metric.observe(client_ttft_ms)
+    if server_ttft_ms > 0:
+        server_ttft_metric.observe(server_ttft_ms)
+    if client_avg_tpot_ms > 0:
+        client_tpot_metric.observe(client_avg_tpot_ms)
+    if server_avg_tpot_ms > 0:
+        server_tpot_metric.observe(server_avg_tpot_ms)
+
+    normalized_time_per_output_token_metric.observe(total_latency_ms / actual_output_len)
+    prompt_length_metric.observe(prompt_len)
+    response_length_metric.observe(actual_output_len)
+
+    return (
+        (prompt_len, actual_output_len, total_latency_ms),
+        server_ttft_ms,
+        client_ttft_ms,
+        server_avg_tpot_ms,
+        client_avg_tpot_ms,
+        predicted_ttft_ms,
+        predicted_tpot_ms,
+        errors
+    )
 
 async def send_request(
     backend: str,
@@ -500,162 +695,186 @@ async def send_request(
     model: str,
     timeout: float,
     max_conn: int,
-) -> Tuple[Tuple[int, int, float], float, List[float], Dict[str, int]]:
-  """Sends request to server."""
-  request_start_time_ms = 1000 * time.time()
-  errors = init_errors_map()
+) -> Tuple[
+      Optional[Tuple[int, int, float]],  # (prompt_len, output_len, latency) or None
+      float,   # server_ttft_ms
+      float,   # client_ttft_ms (always 0 for non-streaming)
+      float,   # server_avg_tpot_ms
+      float,   # client_avg_tpot_ms (always 0 for non-streaming)
+      float,   # predicted_ttft_ms
+      float,   # predicted_tpot_ms
+      Dict[str, int]
+]:
+    """Send non-streaming request with consistent error handling."""
+    request_start_time_ms = 1000 * time.time()
+    errors = init_errors_map()
 
-  headers = {"User-Agent": "Benchmark Client"}
-  if backend == "vllm":
-    pload = {
-        "model": model,
-        "prompt": prompt,
-        "n": 1,
-        "best_of": best_of,
-        "use_beam_search": use_beam_search,
-        "temperature": 0.0 if use_beam_search else 1.0,
-        "top_p": 1.0,
-        "max_tokens": output_len,
-        "ignore_eos": ignore_eos,
-        "stream": False,
-    }
-  elif backend == "tgi":
-    assert not use_beam_search
-    params = {
-        "best_of": best_of,
-        "max_new_tokens": output_len,
-        "do_sample": True,
-    }
-    pload = {
-        "inputs": prompt,
-        "parameters": params,
-    }
-  elif backend == "naive_transformers":
-    # If max_length or top_k is not specified _MAX_LENGTH_DEFAULT = 200 and
-    # _TOP_K_DEFAULT = 10 in peft/handler.py will be used.
-    pload = {
-        "instances": [{
+    headers = {"User-Agent": "Benchmark Client"}
+    
+    # Build payload based on backend
+    if backend == "vllm":
+        pload = {
+            "model": model,
             "prompt": prompt,
-            "max_length": output_len,
+            "n": 1,
+            "best_of": best_of,
+            "use_beam_search": use_beam_search,
+            "temperature": 0.0 if use_beam_search else 1.0,
+            "top_p": 1.0,
+            "max_tokens": output_len,
+            "ignore_eos": ignore_eos,
+            "stream": False,
+        }
+    elif backend == "tgi":
+        pload = {
+            "inputs": prompt,
+            "parameters": {
+                "best_of": best_of,
+                "max_new_tokens": output_len,
+                "do_sample": True,
+            },
+            "stream_options": {"include_usage": "true"}
+        }
+    elif backend == "sax":
+        pload = {
+            "model": sax_model,
+            "prompt": prompt,
+            "max_tokens": output_len,
+            "temperature": 0.0 if use_beam_search else 1.0,
             "top_k": top_k,
-        }]
-    }
-  elif backend == "tensorrt_llm_triton":
-    pload = {
-        "text_input": prompt,
-        "max_tokens": output_len,
-        "beam_width": 1 if not use_beam_search else best_of,
-        "temperature": 0.0 if use_beam_search else 1.0,
-        "top_p": 1.0,
-        "bad_words": "",
-        "stop_words": "",
-        "stream": False,
-    }
-  elif backend == "sax":
-    pload = {
-        "model": sax_model,
-        "prompt": prompt,
-        "n": 1,
-        "best_of": best_of,
-        "use_beam_search": use_beam_search,
-        "temperature": 0.0 if use_beam_search else 1.0,
-        "top_p": 1.0,
-        "top_k": 50,
-        "max_tokens": output_len,
-        "stream": False,
-    }
-  elif backend == "jetstream":
-    pload = {
-        "prompt": prompt,
-        "max_tokens": output_len,
-    }
-  else:
-    raise ValueError(f"Unknown backend: {backend}")
+        }
+    elif backend == "jetstream":
+        pload = {
+            "prompt": prompt,
+            "max_tokens": output_len,
+            "temperature": 0.0 if use_beam_search else 1.0,
+        }
+    else:
+        # Default payload for other backends
+        pload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": output_len,
+            "stream": False,
+        }
 
-  # Set client timeout to be 3 hrs.
-  timeout = aiohttp.ClientTimeout(total=timeout)
-  async with aiohttp.ClientSession(timeout=timeout,trust_env=True,trace_configs=[trace_config],connector=aiohttp.TCPConnector(limit=max_conn)) as session:
-    while True:
-      try:
-        async with session.post(api_url, headers=headers, json=pload, ssl=False) as response:
-          output = await response.json()
-
-        # Re-send the request if it failed.
-        if "error" not in output:
-          break
-      except aiohttp.client_exceptions.ClientConnectorError as client_err:
+    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+    output = None
+    
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout_cfg,
+            trust_env=True,
+            trace_configs=[trace_config],
+            connector=aiohttp.TCPConnector(limit=max_conn),
+        ) as session:
+            async with session.post(api_url, headers=headers, json=pload, ssl=False) as resp:
+                
+                if resp.status != 200:
+                    errors["unknown_error"] += 1
+                    return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+                
+                output = await resp.json()
+                
+                if "error" in output:
+                    errors["unknown_error"] += 1
+                    return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+                    
+    except aiohttp.client_exceptions.ClientConnectorError:
         errors["ClientConnectorError"] += 1
-        print(f"ClientConnectorError: {client_err}")
-        return None, None, None, errors
-      except asyncio.TimeoutError as timeout_err:
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except asyncio.TimeoutError:
         errors["TimeoutError"] += 1
-        print(f"TimeoutError: {timeout_err}")
-        return None, None, None, errors
-      except aiohttp.client_exceptions.ClientOSError as e:
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except aiohttp.client_exceptions.ClientOSError:
         errors["ClientOSError"] += 1
-        print(f"ClientOSError: {e}")
-        return None, None, None, errors
-      except aiohttp.client_exceptions.ContentTypeError as e:
-        print(f"ContentTypeError: {e}, response: {response}")
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except aiohttp.client_exceptions.ContentTypeError:
         errors["ContentTypeError"] += 1
-        return None, None, None, errors
-      except aiohttp.client_exceptions.ServerDisconnectedError as e:
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except aiohttp.client_exceptions.ServerDisconnectedError:
         errors["ServerDisconnectedError"] += 1
-        print(f"ServerDisconnectedError: {e}")
-        return None, None, None, errors
-      except Exception as e: 
-        print(f"Unknown error {e}")
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
+    except Exception as e:
+        print(f"Unexpected error in send_request: {e}")
         errors["unknown_error"] += 1
-        return None, None, None, errors
+        return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, errors
 
-  request_end_time_ms = 1000 * time.time()
-  # Naive HF transformers generation and TensorRT-LLM generation stops at EOS
-  # tokens and the generation may be shorter than the ground-truth output
-  # sequence length.
-  if backend == "naive_transformers":
-    complete_pred = output["predictions"][0][0]["generated_text"]
-    new_text_start_index = complete_pred.find(NEW_TEXT_KEY) + len(NEW_TEXT_KEY)
-    pred = complete_pred[new_text_start_index:]
-    output_token_ids = tokenizer(pred).input_ids
-    output_len = len(output_token_ids) - prompt_len
-  elif backend == "tensorrt_llm_triton":
-    output_token_ids = tokenizer(output["text_output"]).input_ids
-    output_len = len(output_token_ids)
-  elif backend == "sax":
-    output_token_ids = tokenizer(output["choices"][0]["text"]).input_ids
-    output_len = len(output_token_ids)
-  elif backend == "tgi":
-    output_token_ids = tokenizer(output["generated_text"]).input_ids
-    output_len = len(output_token_ids)
-  elif backend == "vllm":
-    output_token_ids = tokenizer(output["choices"][0]["text"]).input_ids
-    output_len = len(output_token_ids)
-  elif backend == "jetstream":
-    output_token_ids = tokenizer(output["response"]).input_ids
-    output_len = len(output_token_ids)
+    request_end_time_ms = 1000 * time.time()
+    total_latency_ms = request_end_time_ms - request_start_time_ms
 
-  # (prompt len, output len, latency, success)
-  request_latency_ms = (prompt_len, output_len, (request_end_time_ms - request_start_time_ms))
-  normalized_time_per_output_token_metric.observe((request_end_time_ms - request_start_time_ms) / output_len)
-  prompt_length_metric.observe(prompt_len)
-  response_length_metric.observe(output_len)
+    # Extract server-provided usage metrics
+    usage = output.get("usage", {}) or {}
+    server_ttft_ms = float(usage.get("ttft_ms", 0.0))
+    predicted_ttft_ms = float(usage.get("predicted_ttft_ms", 0.0))
+    server_avg_tpot_ms = float(usage.get("avg_tpot_ms", 0.0))
+    predicted_tpot_ms = float(usage.get("avg_predicted_tpot_ms", 0.0))
 
-  return request_latency_ms, None, None, None
+    # Calculate actual output length
+    text = ""
+    if backend == "vllm":
+        choices = output.get("choices", [])
+        if choices:
+            text = choices[0].get("text", "")
+    elif backend == "tgi":
+        # TGI response format
+        generated_text = output.get("generated_text", "")
+        text = generated_text
+    elif backend == "sax":
+        # SAX response format
+        text = output.get("text", "")
+    elif backend == "jetstream":
+        # Jetstream response format
+        choices = output.get("choices", [])
+        if choices:
+            text = choices[0].get("text", "")
+    # Add other backends as needed
+    
+    if text:
+        output_token_ids = tokenizer(text).input_ids
+        actual_output_len = len(output_token_ids)
+    else:
+        actual_output_len = output_len
+
+    # Record metrics (only server metrics available for non-streaming)
+    if server_ttft_ms > 0:
+        ttft_metric.observe(server_ttft_ms)
+        server_ttft_metric.observe(server_ttft_ms)
+    if server_avg_tpot_ms > 0:
+        tpot_metric.observe(server_avg_tpot_ms)
+        server_tpot_metric.observe(server_avg_tpot_ms)
+
+    normalized_time_per_output_token_metric.observe(total_latency_ms / actual_output_len)
+    prompt_length_metric.observe(prompt_len)
+    response_length_metric.observe(actual_output_len)
+
+    return (
+        (prompt_len, actual_output_len, total_latency_ms),
+        server_ttft_ms,
+        0.0,  # client_ttft_ms (not available for non-streaming)
+        server_avg_tpot_ms,
+        0.0,  # client_avg_tpot_ms (not available for non-streaming)
+        predicted_ttft_ms,
+        predicted_tpot_ms,
+        errors
+    )
 
 
 async def run_single_request(args: argparse.Namespace, api_url: str, tokenizer: PreTrainedTokenizerBase,
                                prompt: str, prompt_len: int, output_len: int, chosen_model: str) -> Tuple[str, Tuple]:
+    """Run a single request with proper error handling."""
     if args.stream_request:
         result = await send_stream_request(
             args.backend, api_url, prompt, prompt_len, output_len, args.ignore_eos,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model,
-            chosen_model, args.request_timeout, args.tcp_conn_limit)
+            chosen_model, args.request_timeout, args.tcp_conn_limit, args.ttft_slo, args.avg_tpot_slo, args.enable_slo_based_routing)
     else:
         result = await send_request(
             args.backend, api_url, prompt, prompt_len, output_len, args.ignore_eos,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model,
             chosen_model, args.request_timeout, args.tcp_conn_limit)
     return chosen_model, result
+
 
 async def benchmark(
     args: argparse.Namespace, 
@@ -664,31 +883,28 @@ async def benchmark(
     models: List[str],
     traffic_split: List[float],
 ) -> None:
-    """Runs benchmark requests with model selection per request based on weighted ratio.
-    Also saves results separately for each model.
-    """
+    """Runs benchmark requests with improved metrics tracking."""
     input_requests = get_filtered_dataset(
-        args.dataset, args.max_input_length, args.max_output_length, args.min_input_length, args.min_input_length, tokenizer, args.use_dummy_text)
-    
-    # Combine the models list and traffic split list into a dict
-
+        args.dataset, args.max_input_length, args.max_output_length, 
+        args.min_input_length, args.min_input_length, tokenizer, args.use_dummy_text)
     
     if traffic_split is None:
-      traffic_split = [1.0 / len(models)] * len(models)
+        traffic_split = [1.0 / len(models)] * len(models)
     if len(models) != len(traffic_split):
         raise ValueError("The number of models and traffic split values must match")
     total_weight = sum(traffic_split)
     if abs(total_weight - 1.0) > 1e-6:
         raise ValueError(f"Traffic split must sum to 1.0, but got {total_weight}")
+    
     models_dict = dict(zip(models, traffic_split))
     model_names = list(models_dict.keys())
     model_weights = list(models_dict.values())
 
     benchmark_start_time_sec = time.time()
-    # Initialize the counter with target prompts
     await AsyncRequestCounter(args.num_prompts)
     tasks: List[asyncio.Task] = []
     prompts_sent = 0
+    
     async for request in generate_next_request(input_requests, args.request_rate):
         if prompts_sent >= args.num_prompts:
             break
@@ -700,42 +916,121 @@ async def benchmark(
 
     results = await asyncio.gather(*tasks)
 
-    overall_results = {"latencies": [], "ttfts": [], "itls": [], "tpots": [], "errors": init_errors_map()}
+    # Initialize results tracking with expanded metrics including prediction pairs
+    overall_results = {
+        "latencies": [], 
+        "server_ttfts": [], "client_ttfts": [],
+        "server_tpots": [], "client_tpots": [],
+        "predicted_ttfts": [], "predicted_tpots": [],
+        "server_predicted_ttft_pairs": [],  # New: (server, predicted) pairs
+        "server_predicted_tpot_pairs": [],  # New: (server, predicted) pairs
+        "errors": init_errors_map(),
+        "slo_met_count":    0,
+    }
+    
     per_model_results: Dict[str, Dict[str, List]] = {}
     for model in model_names:
-        per_model_results[model] = {"latencies": [], "ttfts": [], "itls": [], "tpots": [], "errors": init_errors_map()}
+        per_model_results[model] = {
+            "latencies": [], 
+            "server_ttfts": [], "client_ttfts": [],
+            "server_tpots": [], "client_tpots": [],
+            "predicted_ttfts": [], "predicted_tpots": [],
+            "server_predicted_ttft_pairs": [],  # New: (server, predicted) pairs
+            "server_predicted_tpot_pairs": [],  # New: (server, predicted) pairs
+            "errors": init_errors_map()
+        }
 
+    # Process results with improved error handling
     for chosen_model, res in results:
-        if res is None:
+        if res is None or res[0] is None:
+            # Handle failed requests - count errors but don't skip entirely
+            if res is not None and len(res) > 7:
+                errors = res[7]
+                for k, v in errors.items():
+                    overall_results["errors"][k] += v
+                    per_model_results[chosen_model]["errors"][k] += v
             continue
-        latency, ttft_ms, itl_ms, errors = res
-        if errors:
-          for k, v in errors.items():
-              overall_results["errors"][k] += v
-              per_model_results[chosen_model]["errors"][k] += v
-        else:
-          prompt_len, output_len, request_latency_ms = latency
-          overall_results["latencies"].append(latency)
-          per_model_results[chosen_model]["latencies"].append(latency)
-          if ttft_ms:
-              overall_results["ttfts"].append(ttft_ms)
-              overall_results["tpots"].append((request_latency_ms - ttft_ms) / (output_len - 1) if output_len > 1 else 0)
-              per_model_results[chosen_model]["ttfts"].append(ttft_ms)
-              per_model_results[chosen_model]["tpots"].append((request_latency_ms - ttft_ms) / (output_len - 1) if output_len > 1 else 0)
-          if itl_ms:
-              overall_results["itls"].extend(itl_ms)     
-              per_model_results[chosen_model]["itls"].extend(itl_ms)     
+            
+        latency, server_ttft, client_ttft, server_tpot, client_tpot, pred_ttft, pred_tpot, errors = res
+        
+        # Count any errors
+        for k, v in errors.items():
+            overall_results["errors"][k] += v
+            per_model_results[chosen_model]["errors"][k] += v
+        
+        # Process successful request metrics
+        if latency is not None:
+            if args.stream_request:  # Only track SLO for streaming requests
+                ttft_slo_met = args.ttft_slo is None or (server_ttft > 0 and server_ttft <= args.ttft_slo)
+                tpot_slo_met = args.avg_tpot_slo is None or (server_tpot > 0 and server_tpot <= args.avg_tpot_slo)
+    
+            if ttft_slo_met and tpot_slo_met:
+                    overall_results["slo_met_count"] += 1
+    
+            overall_results["latencies"].append(latency)
+            per_model_results[chosen_model]["latencies"].append(latency)
+            
+            # Track all timing metrics
+            if server_ttft > 0:
+                overall_results["server_ttfts"].append(server_ttft)
+                per_model_results[chosen_model]["server_ttfts"].append(server_ttft)
+            if client_ttft > 0:
+                overall_results["client_ttfts"].append(client_ttft)
+                per_model_results[chosen_model]["client_ttfts"].append(client_ttft)
+            if server_tpot > 0:
+                overall_results["server_tpots"].append(server_tpot)
+                per_model_results[chosen_model]["server_tpots"].append(server_tpot)
+            if client_tpot > 0:
+                overall_results["client_tpots"].append(client_tpot)
+                per_model_results[chosen_model]["client_tpots"].append(client_tpot)
+            if pred_ttft > 0:
+                overall_results["predicted_ttfts"].append(pred_ttft)
+                per_model_results[chosen_model]["predicted_ttfts"].append(pred_ttft)
+            if pred_tpot > 0:
+                overall_results["predicted_tpots"].append(pred_tpot)
+                per_model_results[chosen_model]["predicted_tpots"].append(pred_tpot)
+            
+            # NEW: Track prediction pairs for error calculation
+            if server_ttft > 0 and pred_ttft > 0:
+                overall_results["server_predicted_ttft_pairs"].append((server_ttft, pred_ttft))
+                per_model_results[chosen_model]["server_predicted_ttft_pairs"].append((server_ttft, pred_ttft))
+
+            if server_tpot > 0 and pred_tpot > 0:
+                overall_results["server_predicted_tpot_pairs"].append((server_tpot, pred_tpot))
+                per_model_results[chosen_model]["server_predicted_tpot_pairs"].append((server_tpot, pred_tpot))
+
 
     benchmark_duration_sec = time.time() - benchmark_start_time_sec
     
-    await print_and_save_result(args, benchmark_duration_sec, prompts_sent, "weighted",
-                          overall_results["latencies"], overall_results["ttfts"],
-                          overall_results["itls"], overall_results["tpots"],
-                          overall_results["errors"], spanner_upload=True, server_metrics_scrape=True)
+    # Print results with both server and client metrics plus prediction errors
+    await print_and_save_result(
+        args, benchmark_duration_sec, prompts_sent, "weighted",
+        overall_results["latencies"], 
+        overall_results["server_ttfts"], overall_results["client_ttfts"],
+        overall_results["predicted_ttfts"], 
+        overall_results["server_tpots"], overall_results["client_tpots"],
+        overall_results["predicted_tpots"],
+        overall_results["server_predicted_ttft_pairs"],  # New parameter
+        overall_results["server_predicted_tpot_pairs"],  # New parameter
+        overall_results["errors"], 
+        overall_results["slo_met_count"],
+        spanner_upload=True, server_metrics_scrape=True
+    )
+    
+    # Print per-model results
     for model, data in per_model_results.items():
-        await print_and_save_result(args, benchmark_duration_sec, len(data["latencies"]), model,
-                              data["latencies"], data["ttfts"], data["itls"],
-                              data["tpots"], data["errors"])
+        await print_and_save_result(
+            args, benchmark_duration_sec, len(data["latencies"]), model,
+            data["latencies"], 
+            data["server_ttfts"], data["client_ttfts"],
+            data["predicted_ttfts"],
+            data["server_tpots"], data["client_tpots"], 
+            data["predicted_tpots"],
+            data["server_predicted_ttft_pairs"],  # New parameter
+            data["server_predicted_tpot_pairs"],  # New parameter
+            data["errors"]
+        )
+
 
 def save_json_results(args: argparse.Namespace, benchmark_result, server_metrics, model, errors, spanner_upload: bool = False):
   # Setup
@@ -1006,94 +1301,220 @@ def get_stats_for_set(name, description, points):
   avg = np.mean(points) if points else 0
   median = np.median(points) if points else 0
   sd = np.std(points) if points else 0
-  min = np.min(points) if points else 0
-  max = np.max(points) if points else 0
+  min_val = np.min(points) if points else 0
+  max_val = np.max(points) if points else 0
   p90 = np.percentile(points, 90) if points else 0
   p99 = np.percentile(points, 99) if points else 0
 
-  print(f"Average {description}:" f" {avg:.2f}")
+  print(f"Average {description}: {avg:.2f}")
 
   return {
     f'avg_{name}':  avg,
     f'median_{name}': median,
     f'sd_{name}': sd,
-    f'min_{name}': min,
-    f'max_{name}': max,
+    f'min_{name}': min_val,
+    f'max_{name}': max_val,
     f'p90_{name}': p90,
     f'p99_{name}': p99,
   }
 
-async def print_and_save_result(args: argparse.Namespace, benchmark_duration_sec, total_requests, model, request_latencies, ttfts, itls, tpots, errors, spanner_upload=False, server_metrics_scrape=False):
-  benchmark_result = {}
+async def print_and_save_result(
+    args: argparse.Namespace, 
+    benchmark_duration_sec, 
+    total_requests, 
+    model, 
+    request_latencies, 
+    server_ttfts, 
+    client_ttfts,
+    predicted_ttfts, 
+    server_tpots, 
+    client_tpots,
+    predicted_tpots,
+    server_predicted_ttft_pairs,  # New parameter
+    server_predicted_tpot_pairs,  # New parameter
+    errors, 
+    slo_met_count=None,
+    spanner_upload=False, 
+    server_metrics_scrape=False
+):
+    benchmark_result = {}
 
-  print(f"====Result for Model: {model}====")
-  print(f"Errors: {errors}")
-  print(f"Total time (seconds): {benchmark_duration_sec:.2f} s")
-  print(f"Successful/total requests: {len(request_latencies)}/{total_requests}")
-  print(f"Requests/sec: {total_requests / benchmark_duration_sec:.2f}")
-  counter = await AsyncRequestCounter()
-  queries_per_second = await counter.get_qps()
-  print(f"Queries/sec: {queries_per_second:.2f}")
-  benchmark_result['queries_per_second'] = queries_per_second
-  benchmark_result["num_prompts_attempted"] = total_requests
-  benchmark_result["num_prompts_succeeded"] = len(request_latencies)
-  benchmark_result['benchmark_time'] = benchmark_duration_sec
-  benchmark_result['throughput_rps'] = (args.num_prompts / benchmark_duration_sec)
+    print(f"====Result for Model: {model}====")
+    print(f"Errors: {errors}")
+    print(f"Total time (seconds): {benchmark_duration_sec:.2f} s")
+    print(f"Successful/total requests: {len(request_latencies)}/{total_requests}")
+    print(f"Requests/sec: {total_requests / benchmark_duration_sec:.2f}")
+    print(f"SLO met count: {slo_met_count if slo_met_count is not None else 'N/A'}")
+    counter = await AsyncRequestCounter()
+    queries_per_second = await counter.get_qps()
+    print(f"Queries/sec: {queries_per_second:.2f}")
+    benchmark_result['queries_per_second'] = queries_per_second
+    benchmark_result["num_prompts_attempted"] = total_requests
+    benchmark_result["num_prompts_succeeded"] = len(request_latencies)
+    benchmark_result['throughput_rps'] = (args.num_prompts / benchmark_duration_sec)
+    benchmark_result['benchmark_time'] = benchmark_duration_sec
+    benchmark_result['slo_met_count'] = slo_met_count if slo_met_count is not None else benchmark_result["num_prompts_succeeded"]
+    benchmark_result['slo_met_perc'] = slo_met_count / benchmark_result["num_prompts_attempted"] * 100 if benchmark_result["num_prompts_attempted"] > 0 and slo_met_count is not None else 0
 
-  total_output_tokens = np.sum([output_len for _, output_len, _ in
-                                request_latencies])
-  output_tokens_per_second = total_output_tokens / benchmark_duration_sec
-  benchmark_result['throughput'] = output_tokens_per_second
+    total_output_tokens = np.sum([output_len for _, output_len, _ in
+                                  request_latencies])
+    output_tokens_per_second = total_output_tokens / benchmark_duration_sec
+    benchmark_result['throughput'] = output_tokens_per_second
 
-  print(f"Output_tokens/sec: {output_tokens_per_second:.2f}")
-  benchmark_result['total_output_token'] = int(total_output_tokens)
+    print(f"Output_tokens/sec: {output_tokens_per_second:.2f}")
+    benchmark_result['total_output_token'] = int(total_output_tokens)
 
-  total_input_tokens = np.sum([prompt_len for prompt_len, _, _ in
-                               request_latencies])
-  input_tokens_per_sec = total_input_tokens / benchmark_duration_sec
-  print(f"Input_tokens/sec: {input_tokens_per_sec:.2f}")
-  benchmark_result['total_input_tokens'] = int(total_input_tokens)
-  benchmark_result['input_tokens_per_sec'] = input_tokens_per_sec
+    total_input_tokens = np.sum([prompt_len for prompt_len, _, _ in
+                                 request_latencies])
+    input_tokens_per_sec = total_input_tokens / benchmark_duration_sec
+    print(f"Input_tokens/sec: {input_tokens_per_sec:.2f}")
+    benchmark_result['total_input_tokens'] = int(total_input_tokens)
+    benchmark_result['input_tokens_per_sec'] = input_tokens_per_sec
 
-  total_tokens = total_input_tokens + total_output_tokens
-  tokens_per_sec = total_tokens / benchmark_duration_sec
-  print(f"Tokens/sec: {tokens_per_sec:.2f}")
-  benchmark_result['total_tokens'] = int(total_tokens)
-  benchmark_result['tokens_per_sec'] = tokens_per_sec
-  ttft_stats = {}
-  itls_stats = {}
-  tpot_stats = {}
-  if args.stream_request:
-    ttft_stats = get_stats_for_set("TTFT_ms", "Time to First Token (ms)", ttfts)
-    itls_stats = get_stats_for_set("ITL_ms", "Inter-Token Latency (ms)", itls)
-    tpot_stats = get_stats_for_set("TPOT_ms", "Time Per Output Token (ms)", tpots)
-  if args.machine_cost:
-    print(
-        "Cost $/1k tokens:"
-        f" {args.machine_cost * 1000 / output_tokens_per_second}"
-    )
+    total_tokens = total_input_tokens + total_output_tokens
+    tokens_per_sec = total_tokens / benchmark_duration_sec
+    print(f"Tokens/sec: {tokens_per_sec:.2f}")
+    benchmark_result['total_tokens'] = int(total_tokens)
+    benchmark_result['tokens_per_sec'] = tokens_per_sec
+    
+    # Process server and client TTFT metrics
+    server_ttft_stats = {}
+    client_ttft_stats = {}
+    combined_ttft_stats = {}
+    
+    # Process server and client TPOT metrics
+    server_tpot_stats = {}
+    client_tpot_stats = {}
+    combined_tpot_stats = {}
+    
+    # Process predicted metrics
+    predicted_ttft_stats = {}
+    predicted_tpot_stats = {}
+    
+    # NEW: Process prediction error metrics
+    ttft_prediction_error_stats = {}
+    tpot_prediction_error_stats = {}
+    
+    ttft_per_input_token_stats = {}
+    
+    if args.stream_request:
+        # Server TTFT stats
+        if server_ttfts:
+            server_ttft_stats = get_stats_for_set("server_TTFT_ms", "Server Time to First Token (ms)", server_ttfts)
+            print("Server TTFT metrics:")
+            for key, value in server_ttft_stats.items():
+                print(f"  {key}: {value:.2f}")
+        
+        # Client TTFT stats  
+        if client_ttfts:
+            client_ttft_stats = get_stats_for_set("client_TTFT_ms", "Client Time to First Token (ms)", client_ttfts)
+            print("Client TTFT metrics:")
+            for key, value in client_ttft_stats.items():
+                print(f"  {key}: {value:.2f}")
+        
+        # Combined TTFT (prefer server when available, fall back to client)
+        combined_ttfts = []
+        for i in range(len(request_latencies)):
+            if i < len(server_ttfts) and server_ttfts[i] > 0:
+                combined_ttfts.append(server_ttfts[i])
+            elif i < len(client_ttfts) and client_ttfts[i] > 0:
+                combined_ttfts.append(client_ttfts[i])
+        
+        if combined_ttfts:
+            combined_ttft_stats = get_stats_for_set("TTFT_ms", "Combined Time to First Token (ms)", combined_ttfts)
+        
+        # Server TPOT stats
+        if server_tpots:
+            server_tpot_stats = get_stats_for_set("server_TPOT_ms", "Server Time Per Output Token (ms)", server_tpots)
+            print("Server TPOT metrics:")
+            for key, value in server_tpot_stats.items():
+                print(f"  {key}: {value:.2f}")
+        
+        # Client TPOT stats
+        if client_tpots:
+            client_tpot_stats = get_stats_for_set("client_TPOT_ms", "Client Time Per Output Token (ms)", client_tpots)
+            print("Client TPOT metrics:")
+            for key, value in client_tpot_stats.items():
+                print(f"  {key}: {value:.2f}")
+        
+        # Combined TPOT (prefer server when available, fall back to client)
+        combined_tpots = []
+        for i in range(len(request_latencies)):
+            if i < len(server_tpots) and server_tpots[i] > 0:
+                combined_tpots.append(server_tpots[i])
+            elif i < len(client_tpots) and client_tpots[i] > 0:
+                combined_tpots.append(client_tpots[i])
+        
+        if combined_tpots:
+            combined_tpot_stats = get_stats_for_set("TPOT_ms", "Combined Time Per Output Token (ms)", combined_tpots)
+        
+        # Predicted metrics
+        if predicted_ttfts:
+            predicted_ttft_stats = get_stats_for_set("predicted_TTFT_ms", "Predicted Time to First Token (ms)", predicted_ttfts)
+        if predicted_tpots:
+            predicted_tpot_stats = get_stats_for_set("predicted_TPOT_ms", "Predicted Time Per Output Token (ms)", predicted_tpots)
+        
+        # NEW: Calculate prediction error metrics
+        if server_predicted_ttft_pairs:
+            server_ttfts_for_error = [pair[0] for pair in server_predicted_ttft_pairs]
+            predicted_ttfts_for_error = [pair[1] for pair in server_predicted_ttft_pairs]
+            ttft_prediction_error_stats = get_prediction_error_stats("TTFT", server_ttfts_for_error, predicted_ttfts_for_error)
+        
+        if server_predicted_tpot_pairs:
+            server_tpots_for_error = [pair[0] for pair in server_predicted_tpot_pairs]
+            predicted_tpots_for_error = [pair[1] for pair in server_predicted_tpot_pairs]
+            tpot_prediction_error_stats = get_prediction_error_stats("TPOT", server_tpots_for_error, predicted_tpots_for_error)
+        
+        # TTFT per input token calculation
+        ttft_per_input_token = []
+        for i, (prompt_len, _, _) in enumerate(request_latencies):
+            if prompt_len > 0:
+                if i < len(combined_ttfts):
+                    ttft_per_input_token.append(combined_ttfts[i] / prompt_len)
+                elif i < len(server_ttfts) and server_ttfts[i] > 0:
+                    ttft_per_input_token.append(server_ttfts[i] / prompt_len)
+                elif i < len(client_ttfts) and client_ttfts[i] > 0:
+                    ttft_per_input_token.append(client_ttfts[i] / prompt_len)
+        
+        if ttft_per_input_token:
+            ttft_per_input_token_stats = get_stats_for_set("TTFT_per_input_token_ms", "Time to First Token per Input Token (ms/token)", ttft_per_input_token)
 
-  benchmark_result = {
-    **benchmark_result,
-    **(get_stats_for_set("per_token_latency_ms", "milliseconds/token (includes waiting time on server)", [
-      latency / (prompt_len + output_len)
-      for prompt_len, output_len, latency in request_latencies
-    ])),
-    **ttft_stats,
-    **itls_stats,
-    # NOTE: The latency below includes requests awaiting time on server side.
-    # It's not comparable with the model inference latency for batch size 1.
-    **(get_stats_for_set("latency_ms", "milliseconds/request (includes waiting time on server)" ,[latency for _, _, latency in request_latencies])),
-    **(get_stats_for_set("normalized_time_per_output_token_ms", "milliseconds/output_token (includes waiting time on server)", [latency / output_len for _, output_len, latency in request_latencies])),
-    **(get_stats_for_set("input_len", "input length", [float(prompt_len) for prompt_len, _, _ in request_latencies])),
-    **(get_stats_for_set("output_len", "output length", [float(output_len) for _, output_len, _ in request_latencies]))
-  }
+    if args.machine_cost:
+        print(
+            "Cost $/1k tokens:"
+            f" {args.machine_cost * 1000 / output_tokens_per_second}"
+        )
 
-  server_metrics = {}
-  if args.scrape_server_metrics and server_metrics_scrape:
-    server_metrics = print_metrics(metrics_to_scrape(args.backend), benchmark_duration_sec, args.pm_namespace, args.pm_job)
-  if args.save_json_results:
-    save_json_results(args, benchmark_result, server_metrics, model, errors, spanner_upload)
+    benchmark_result = {
+        **benchmark_result,
+        **(get_stats_for_set("per_token_latency_ms", "milliseconds/token (includes waiting time on server)", [
+            latency / (prompt_len + output_len)
+            for prompt_len, output_len, latency in request_latencies
+        ])),
+        **combined_ttft_stats,
+        **server_ttft_stats,
+        **client_ttft_stats,
+        **ttft_per_input_token_stats,
+        **combined_tpot_stats,
+        **server_tpot_stats,
+        **client_tpot_stats,
+        **predicted_ttft_stats,
+        **predicted_tpot_stats,
+        **ttft_prediction_error_stats,  # NEW: Add prediction error stats
+        **tpot_prediction_error_stats,  # NEW: Add prediction error stats
+        # NOTE: The latency below includes requests awaiting time on server side.
+        # It's not comparable with the model inference latency for batch size 1.
+        **(get_stats_for_set("latency_ms", "milliseconds/request (includes waiting time on server)" ,[latency for _, _, latency in request_latencies])),
+        **(get_stats_for_set("normalized_time_per_output_token_ms", "milliseconds/output_token (includes waiting time on server)", [latency / output_len for _, output_len, latency in request_latencies])),
+        **(get_stats_for_set("input_len", "input length", [float(prompt_len) for prompt_len, _, _ in request_latencies])),
+        **(get_stats_for_set("output_len", "output length", [float(output_len) for _, output_len, _ in request_latencies]))
+    }
+
+    server_metrics = {}
+    if args.scrape_server_metrics and server_metrics_scrape:
+        server_metrics = print_metrics(metrics_to_scrape(args.backend), benchmark_duration_sec, args.pm_namespace, args.pm_job)
+    if args.save_json_results:
+        save_json_results(args, benchmark_result, server_metrics, model, errors, spanner_upload)
 
 async def main(args: argparse.Namespace):
   print(args)
@@ -1124,8 +1545,8 @@ async def main(args: argparse.Namespace):
       if not blob.exists():
         blob.upload_from_string('')
 
-  print(f"Starting Prometheus Server on port {PROMETHEUS_PORT}")
-  start_http_server(PROMETHEUS_PORT)
+  print(f"Starting Prometheus Server on port {args.prometheus_port}")
+  start_http_server(args.prometheus_port)
 
   api_url = f"http://{args.host}:{args.port}/{endpoint}"
   tokenizer = AutoTokenizer.from_pretrained(
@@ -1252,6 +1673,7 @@ if __name__ == "__main__":
   parser.add_argument(
     "--ignore-eos",
     action="store_true",
+    default=True,
     help=(
         "If set and model server is vllm, the generation process will ignore the end-of-sequence (EOS) token, "
         "allowing output to continue until reaching --max-output-length or another stopping condition."
@@ -1354,6 +1776,34 @@ if __name__ == "__main__":
        default=None,
        help="Spanner database ID to upload results to.",
   )
+  
+  parser.add_argument(
+     "--ttft-slo",
+     type=float,
+     default=None,
+     help="Desired ttft SLO in milliseconds",
+   )
+  parser.add_argument(
+     "--avg-tpot-slo",
+     type=float,
+     default=None,
+     help="Desired average tpot SLO in milliseconds",
+   )
+  parser.add_argument(
+    "--enable-slo-based-routing",
+    action="store_true",
+    default=False,
+     help="Enable SLO-based routing. If set, the benchmark will route requests based on the SLOs provided for ttft and tpot.",
+   )
+  
+  parser.add_argument(
+     "--prometheus-port",
+     type=int,
+     default=9090,
+     help="Port for Prometheus metrics",
+   )
+
+  
   parser.add_argument("--pm-namespace", type=str, default="default", help="namespace of the pod monitoring object, ignored if scrape-server-metrics is false")
   parser.add_argument("--pm-job", type=str, default="vllm-podmonitoring", help="name of the pod monitoring object, ignored if scrape-server-metrics is false")
   parser.add_argument("--tcp-conn-limit", type=int, default=100, help="Max number of tcp connections allowed per aiohttp ClientSession")
