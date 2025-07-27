@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lpg-slo-routing
+  namespace: default
+  labels:
+    name: lpg-slo-routing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: lpg-slo-routing
+  template:
+    metadata:
+      labels:
+        name: lpg-slo-routing
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      serviceAccountName: "gmp-test-sa"  
+      nodeSelector:
+        cloud.google.com/gke-nodepool: "pool-1"  
+      containers:
+        - name: lpg-slo-routing
+          image:   us-docker.pkg.dev/kaushikmitra-gke-dev/kaushikmitra-docker-repo/llm-ig-latency-profile-benchmarking-regression-script-v2:latest
+          imagePullPolicy: Always
+          command: ["bash", "-c", "./latency_throughput_curve.sh"]
+          env:
+            - name: TOKENIZER
+              value: "google/gemma-3-27b-it"
+            - name: BACKEND
+              value: "vllm"
+            - name: IP
+              value: "34.2.138.189"  
+            - name: PORT
+              value: "80" 
+            - name: INPUT_LENGTH
+              value: "2048"
+            - name: OUTPUT_LENGTH
+              value: "2048"
+            - name: REQUEST_RATES_1
+              value: "10,20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180"  # Replace with your desired request rates
+            - name: REQUEST_RATES_2
+              value: "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18"  # Replace with your desired request rates
+            - name: BENCHMARK_TIME_SECONDS
+              value: "100"
+            # - name: `FILE_PREFIX_1
+            # value: "critical-servers-concurrent-sharegpt-slo-p90-ttft-200-tpot-100-v5"  # Replace with your desired file prefix
+            # - name: FILE_PREFIX_2
+            # value: "critical-servers-concurrent-code-slo-p90-ttft-200-tpot-100-v5"  # Replace with your desired file prefix
+            - name: FILE_PREFIX_1
+              value: "gemma-classifier-standard-3-servers-slo-routing-v4"  # Replace with your desired file prefix
+            - name: FILE_PREFIX_2
+              value: "gemma-summarizer-standard-3-servers-slo-routing-v4"  # Replace with your desired file prefix
+            - name: MODELS
+              value: "google/gemma-3-27b-it"
+            - name: SAVE_AGGREGATED_RESULT
+              value: "true"
+            - name: DATASET1
+              value: "ag_news_train_sharegpt.json"  # Replace with your prompt dataset file
+            - name: DATASET2
+              value: "mediasum_train_basic_sharegpt.json"  # Replace with your prompt dataset file
+            - name: OUTPUT_BUCKET
+              value: "kaushikmitra-llm-ig-benchmark"
+            - name: OUTPUT_BUCKET_FILEPATH
+              value: "slo-routing-krk-30"       
+            - name: STREAM_REQUEST
+              value: "true"
+            - name: SCRAPE_SERVER_METRICS
+              value: "true"
+            - name: PM_JOB
+              value: "vllm-podmonitoring"
+            - name: PM_NAMESPACE
+              value: "default"
+            - name: TTFT_SLO_1
+              value: "200"
+            - name: AVG_TPOT_SLO_1
+              value: "100"
+            - name: ENABLE_SLO_BASED_ROUTING_1
+              value: "true"
+            - name: TTFT_SLO_2
+              value: "1000"
+            - name: AVG_TPOT_SLO_2
+              value: "200"
+            - name: ENABLE_SLO_BASED_ROUTING_2
+              value: "true"
+            - name: PROMETHEUS_PORT_1
+              value: "9090"  # Replace with your desired Prometheus port for the first
+            - name: PROMETHEUS_PORT_2
+              value: "9091"  # Replace with your desired Prometheus port for the second
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+ 
