@@ -391,12 +391,16 @@ async def send_stream_request(
     model: str,
     timeout: float,
     max_conn: int,
+    inference_objective: str,
+    target_model_header: Optional[str] = None,
 ) -> Tuple[Tuple[int, int, float], float, List[float], Dict[str, int]]:
   """Sends stream request to server"""
   request_start_time_ms = 1000 * time.time()
   errors = init_errors_map()
 
-  headers = {"User-Agent": "Benchmark Client"}
+  headers = {"User-Agent": "Benchmark Client", "x-gateway-inference-objective": inference_objective}
+  if target_model_header:
+        headers["x-gateway-model-name-rewrite"] = target_model_header
   if backend == "vllm":
     pload = {
         "model": model,
@@ -500,12 +504,16 @@ async def send_request(
     model: str,
     timeout: float,
     max_conn: int,
+    inference_objective: str,
+    target_model_header: Optional[str] = None,
 ) -> Tuple[Tuple[int, int, float], float, List[float], Dict[str, int]]:
   """Sends request to server."""
   request_start_time_ms = 1000 * time.time()
   errors = init_errors_map()
 
-  headers = {"User-Agent": "Benchmark Client"}
+  headers = {"User-Agent": "Benchmark Client", "x-gateway-inference-objective": inference_objective}
+  if target_model_header:
+        headers["x-gateway-model-name-rewrite"] = target_model_header
   if backend == "vllm":
     pload = {
         "model": model,
@@ -644,17 +652,17 @@ async def send_request(
 
 
 async def run_single_request(args: argparse.Namespace, api_url: str, tokenizer: PreTrainedTokenizerBase,
-                               prompt: str, prompt_len: int, output_len: int, chosen_model: str) -> Tuple[str, Tuple]:
+                               prompt: str, prompt_len: int, output_len: int, chosen_model: str, target_model_header: Optional[str],) -> Tuple[str, Tuple]:
     if args.stream_request:
         result = await send_stream_request(
             args.backend, api_url, prompt, prompt_len, output_len, args.ignore_eos,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model,
-            chosen_model, args.request_timeout, args.tcp_conn_limit)
+            chosen_model, args.request_timeout, args.tcp_conn_limit, args.inference_objective, target_model_header=target_model_header)
     else:
         result = await send_request(
             args.backend, api_url, prompt, prompt_len, output_len, args.ignore_eos,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model,
-            chosen_model, args.request_timeout, args.tcp_conn_limit)
+            chosen_model, args.request_timeout, args.tcp_conn_limit, args.inference_objective, target_model_header=target_model_header)
     return chosen_model, result
 
 async def benchmark(
@@ -668,7 +676,7 @@ async def benchmark(
     Also saves results separately for each model.
     """
     input_requests = get_filtered_dataset(
-        args.dataset, args.max_input_length, args.max_output_length, args.min_input_length, args.min_input_length, tokenizer, args.use_dummy_text)
+        args.dataset, args.max_input_length, args.max_output_length, args.min_input_length, args.min_output_length, tokenizer, args.use_dummy_text)
     
     # Combine the models list and traffic split list into a dict
 
@@ -683,6 +691,7 @@ async def benchmark(
     models_dict = dict(zip(models, traffic_split))
     model_names = list(models_dict.keys())
     model_weights = list(models_dict.values())
+    target_map = args.targetmodels or {}
 
     benchmark_start_time_sec = time.time()
     # Initialize the counter with target prompts
@@ -694,7 +703,8 @@ async def benchmark(
             break
         prompt, prompt_len, output_len = request
         chosen_model = random.choices(model_names, weights=model_weights)[0]
-        task = asyncio.create_task(run_single_request(args, api_url, tokenizer, prompt, prompt_len, output_len, chosen_model))
+        target_model_header = target_map.get(chosen_model)
+        task = asyncio.create_task(run_single_request(args, api_url, tokenizer, prompt, prompt_len, output_len, chosen_model, target_model_header=target_model_header))
         tasks.append(task)
         prompts_sent += 1
 
@@ -1138,7 +1148,22 @@ async def main(args: argparse.Namespace):
   await benchmark(args, api_url, tokenizer,models, args.traffic_split)
   
 
-
+def parse_targetmodels(arg: Optional[str]):
+    """Parse mappings like 'srcA:dstA,srcB:dstB' into a dict."""
+    if arg is None:
+        return {}
+    mapping = {}
+    try:
+        for item in arg.split(','):
+            if not item.strip():
+                continue
+            src, dst = item.split(':', 1)
+            mapping[src.strip()] = dst.strip()
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "targetmodels must be 'src:dst,src2:dst2' (comma-separated 'src:dst' pairs)."
+        )
+    return mapping
 
 def parse_traffic_split(arg):
     try:
@@ -1181,6 +1206,22 @@ if __name__ == "__main__":
     type=str,
     help="Comma separated list of models to benchmark.",
   )
+  
+  parser.add_argument(
+      "--inference-objective",
+      type=str,
+      default="base-model",
+      help="Value for the 'x-gateway-inference-objective' header (e.g., 'base-model', 'slo-aware').",
+  )
+  
+  parser.add_argument(
+    "--targetmodels",
+    type=parse_targetmodels,
+    default=None,
+    help="Optional mapping 'src_model:target_model,src2:target2'. If present and a chosen model matches a key, "
+         "the request header 'x-gateway-model-name-rewrite' will be set to the mapped target value."
+)
+  
   parser.add_argument(
     "--traffic-split",
     type=parse_traffic_split,
