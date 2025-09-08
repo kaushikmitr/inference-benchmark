@@ -462,6 +462,7 @@ async def send_stream_request(
     ttft_slo: Optional[float] = None,
     avg_tpot_slo: Optional[float] = None,
     enable_slo_based_routing: bool = False,
+    gateway_inference_objective: Optional[str] = None,
 ) -> Tuple[
       Optional[Tuple[int, int, float]],  # (prompt_len, output_len, latency) or None
       float,   # server_ttft_ms
@@ -494,10 +495,14 @@ async def send_stream_request(
 
     # Build headers & payload
     headers = {"User-Agent": "Benchmark Client"}
+    if gateway_inference_objective is not None:
+        headers["x-gateway-inference-objective"] = gateway_inference_objective
     if ttft_slo is not None and enable_slo_based_routing:
         headers["ttft_slo"] = f"{ttft_slo:.6f}"
     if avg_tpot_slo is not None and enable_slo_based_routing:
         headers["avg_tpot_slo"] = f"{avg_tpot_slo:.6f}"
+    if enable_slo_based_routing:
+        headers["prediction_based_scheduling"] = "true"
 
     pload = {
         "model": model,
@@ -695,6 +700,7 @@ async def send_request(
     model: str,
     timeout: float,
     max_conn: int,
+    gateway_inference_objective: Optional[str] = None,
 ) -> Tuple[
       Optional[Tuple[int, int, float]],  # (prompt_len, output_len, latency) or None
       float,   # server_ttft_ms
@@ -710,6 +716,8 @@ async def send_request(
     errors = init_errors_map()
 
     headers = {"User-Agent": "Benchmark Client"}
+    if gateway_inference_objective is not None:
+        headers["x-gateway-inference-objective"] = gateway_inference_objective
     
     # Build payload based on backend
     if backend == "vllm":
@@ -863,16 +871,18 @@ async def send_request(
 async def run_single_request(args: argparse.Namespace, api_url: str, tokenizer: PreTrainedTokenizerBase,
                                prompt: str, prompt_len: int, output_len: int, chosen_model: str) -> Tuple[str, Tuple]:
     """Run a single request with proper error handling."""
+    effective_output_len = args.overwrite_max_output_length if args.overwrite_max_output_length is not None else output_len
+
     if args.stream_request:
         result = await send_stream_request(
-            args.backend, api_url, prompt, prompt_len, output_len, args.ignore_eos,
+            args.backend, api_url, prompt, prompt_len, effective_output_len, args.ignore_eos,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model,
-            chosen_model, args.request_timeout, args.tcp_conn_limit, args.ttft_slo, args.avg_tpot_slo, args.enable_slo_based_routing)
+            chosen_model, args.request_timeout, args.tcp_conn_limit, args.ttft_slo, args.avg_tpot_slo, args.enable_slo_based_routing, args.gateway_inference_objective)
     else:
         result = await send_request(
-            args.backend, api_url, prompt, prompt_len, output_len, args.ignore_eos,
+            args.backend, api_url, prompt, prompt_len, effective_output_len, args.ignore_eos,
             args.best_of, args.use_beam_search, args.top_k, tokenizer, args.sax_model,
-            chosen_model, args.request_timeout, args.tcp_conn_limit)
+            chosen_model, args.request_timeout, args.tcp_conn_limit, args.gateway_inference_objective)
     return chosen_model, result
 
 
@@ -1802,6 +1812,23 @@ if __name__ == "__main__":
      default=9090,
      help="Port for Prometheus metrics",
    )
+  # ... inside if __name__ == "__main__": after existing parser.add_argument(...) blocks
+  parser.add_argument(
+    "--overwrite-max-output-length",
+    type=int,
+    default=None,
+    help=(
+        "If set, overrides the per-request output length used in payloads "
+        "(e.g., vLLM/Jetstream/TensorRT-LLM/SAX: max_tokens; TGI: max_new_tokens; "
+        "naive_transformers: max_length). Does not affect dataset filtering."
+    ),
+  )
+  parser.add_argument(
+    "--gateway-inference-objective",
+    type=str,
+    default=None,
+    help="Value for x-gateway-inference-objective header if specified",
+)
 
   
   parser.add_argument("--pm-namespace", type=str, default="default", help="namespace of the pod monitoring object, ignored if scrape-server-metrics is false")

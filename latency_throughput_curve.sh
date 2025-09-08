@@ -78,6 +78,9 @@ for i in "${!RATES_1[@]}"; do
   [[ "$TTFT_SLO_1" ]] && PY_OPTS1+=("--ttft-slo=$TTFT_SLO_1")
   [[ "$AVG_TPOT_SLO_1" ]] && PY_OPTS1+=("--avg-tpot-slo=$AVG_TPOT_SLO_1")
   [[ "$ENABLE_SLO_BASED_ROUTING_1" = "true" ]] && PY_OPTS1+=("--enable-slo-based-routing")
+  [[ "$OVERWRITE_MAX_OUTPUT_LENGTH" ]] && PY_OPTS1+=("--overwrite-max-output-length=$OVERWRITE_MAX_OUTPUT_LENGTH")
+  [[ "$GATEWAY_INFERENCE_OBJECTIVE_1" ]] && PY_OPTS1+=("--gateway-inference-objective=$GATEWAY_INFERENCE_OBJECTIVE_1")
+    
 
   output_file_1="latency-profile-${timestamp}-dataset1.txt"
   $PYTHON "${PY_OPTS1[@]}" > "$output_file_1" &
@@ -117,6 +120,8 @@ for i in "${!RATES_1[@]}"; do
     [[ "$TTFT_SLO_2" ]] && PY_OPTS2+=("--ttft-slo=$TTFT_SLO_2")
     [[ "$AVG_TPOT_SLO_2" ]] && PY_OPTS2+=("--avg-tpot-slo=$AVG_TPOT_SLO_2")
     [[ "$ENABLE_SLO_BASED_ROUTING_2" = "true" ]] && PY_OPTS2+=("--enable-slo-based-routing")
+    [[ "$OVERWRITE_MAX_OUTPUT_LENGTH" ]] && PY_OPTS2+=("--overwrite-max-output-length=$OVERWRITE_MAX_OUTPUT_LENGTH")
+    [[ "$GATEWAY_INFERENCE_OBJECTIVE_2" ]] && PY_OPTS2+=("--gateway-inference-objective=$GATEWAY_INFERENCE_OBJECTIVE_2")
 
     output_file_2="latency-profile-${timestamp}-dataset2.txt"
     $PYTHON "${PY_OPTS2[@]}" > "$output_file_2" &
